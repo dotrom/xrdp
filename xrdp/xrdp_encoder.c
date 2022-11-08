@@ -47,6 +47,24 @@ static const unsigned char g_rfx_quantization_values[] =
 };
 #endif
 
+#define SAVE_VIDEO
+#ifdef SAVE_VIDEO
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#define MAX_SAVE_FILES 256
+#define SAVE_FOLDER "/tmp"
+
+/* Save file descriptors and their associated session GUIDs */
+static struct {
+    FILE *h264;
+    FILE *ts;
+    unsigned long long ts_off;
+    struct guid guid;
+} save_files[MAX_SAVE_FILES] = {0};
+#endif
+
 /*****************************************************************************/
 static int
 process_enc_jpg(struct xrdp_encoder *self, XRDP_ENC_DATA *enc);
@@ -292,6 +310,21 @@ xrdp_encoder_delete(struct xrdp_encoder *self)
     }
     tc_mutex_delete(self->mutex);
     g_free(self);
+
+    /* close save file descriptor */
+#ifdef SAVE_VIDEO
+    /* As described in function `n_save_data`, both file pointers should be in
+     * sync. */
+    for (unsigned int i = 0; i < MAX_SAVE_FILES; ++i) {
+	if (save_files[i].h264) {
+	    fclose(save_files[i].h264);
+	    save_files[i].h264 = NULL;
+
+	    fclose(save_files[i].ts);
+	    save_files[i].ts = NULL;
+	}
+    }
+#endif
 }
 
 /*****************************************************************************/
@@ -533,44 +566,144 @@ process_enc_rfx(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
 }
 #endif
 
-#define SAVE_VIDEO 0
+#ifdef SAVE_VIDEO
+static int n_save_data(
+    struct xrdp_encoder *self,
+    const char *data,
+    int data_size,
+    int width,
+    int height
+) {
+    /* Timestamp calculation */
+    static struct timespec last, now, delta;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) {
+	LOG(LOG_LEVEL_ERROR, "save_data: gettime failed");
+	return 1;
+    }
 
-#if SAVE_VIDEO
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
+    /* Open save file for the first time or we are in a new session. Both file
+     * pointers should be in sync, i.e. either `save_file_h264` or
+     * `save_file_ts` being `NULL` is considered an invalid state. */
+    int display = self->mm->display;
+    if (
+	!save_files[display].h264
+	|| memcmp(self->mm->guid.g, save_files[display].guid.g, GUID_SIZE)
+    ) {
+	/* Setup save file slot with current session */
+	if (save_files[display].h264) {
+	    fclose(save_files[display].h264);
+	    fclose(save_files[display].ts);
+	}
+	save_files[display].guid = self->mm->guid;
 
-static int n_save_data(const char *data, int data_size, int width, int height)
-{
-    int fd;
+	/* Query username from login */
+	static const char *username = NULL;
+	struct list *names = self->mm->login_names,
+		    *values = self->mm->login_values;
+	for (int i = names->count - 1; i >= 0; --i) {
+	    const char *const name = (const char *)list_get_item(names, i);
+	    if (name && !strcasecmp(name, "username")) {
+		username = (const char *)list_get_item(values, i);
+		break;
+	    }
+	}
+	if (!username) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: get username failed");
+	    return 1;
+	}
+
+	/* Build save file path */
+	static char path_prefix[256], path[512];
+	static time_t raw_time;
+	if ((raw_time = time(NULL)) == -1)
+	    LOG(LOG_LEVEL_ERROR, "save_data: get raw time failed");
+	static struct tm *ptm;
+	if (!(ptm = localtime(&raw_time))) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: get local time failed");
+	    return 1;
+	}
+	if (snprintf(
+	    path_prefix,
+	    256,
+	    "%.20s_%d-%02d-%02d_%02d-%02d-%02d",
+	    username,
+	    ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
+	    ptm->tm_hour, ptm->tm_min, ptm->tm_sec
+	) < 0) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: build path prefix failed");
+	    return 1;
+	}
+
+	/* Open raw video and timestamp files */
+	if (snprintf(path, 512, SAVE_FOLDER"/%s.264", path_prefix) < 0) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: build h264 path failed");
+	    return 1;
+	}
+	if (!(save_files[display].h264 = fopen(path, "w"))) {
+	    save_files[display].h264 = NULL;
+	    LOG(LOG_LEVEL_ERROR, "save_data: open h264 file failed");
+	    return 1;
+	}
+
+	if (snprintf(path, 512, SAVE_FOLDER"/%s.ts", path_prefix) < 0) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: build ts path failed");
+	    return 1;
+	}
+	save_files[display].ts = fopen(path, "w");
+	if (!(save_files[display].ts = fopen(path, "w"))) {
+	    save_files[display].ts = NULL;
+	    LOG(LOG_LEVEL_ERROR, "save_data: open ts file failed");
+	    return 1;
+	}
+	fprintf(save_files[display].ts, "# timestamp format v2\n");
+	if (ferror(save_files[display].ts)) {
+	    LOG(LOG_LEVEL_ERROR, "save_data: writing timestamp header failed");
+	    return 1;
+	}
+
+	/* Initialize `last` timestamp with `now` and start off at 0 */
+    	save_files[display].ts_off = 0;
+	last = now;
+    }
+
+    /* Write raw video data */
     struct _header
     {
         char tag[4];
         int width;
         int height;
-        int bytes_follow;
-    } header;
-
-    fd = open("video.bin", O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
-    lseek(fd, 0, SEEK_END);
-    header.tag[0] = 'B';
-    header.tag[1] = 'E';
-    header.tag[2] = 'E';
-    header.tag[3] = 'F';
-    header.width = width;
-    header.height = height;
-    header.bytes_follow = data_size;
-    if (write(fd, &header, 16) != 16)
-    {
-        g_printf("save_data: write failed\n");
+        int size;
+    } header = { .tag="BEEF", .width=width, .height=height, .size=data_size };
+    fwrite(&header, 16, 1, save_files[display].h264);
+    if (ferror(save_files[display].h264)) {
+	LOG(LOG_LEVEL_ERROR, "save_data: write failed");
+    	return 1;
+    }
+    fwrite(data, data_size, 1, save_files[display].h264);
+    if (ferror(save_files[display].h264)) {
+	LOG(LOG_LEVEL_ERROR, "save_data: write failed");
+    	return 1;
     }
 
-    if (write(fd, data, data_size) != data_size)
-    {
-        g_printf("save_data: write failed\n");
+    /* Calculate delta time and write timestamp data */
+    delta.tv_sec = now.tv_sec - last.tv_sec;
+    delta.tv_nsec = now.tv_nsec - last.tv_nsec;
+    if (delta.tv_nsec < 0) {
+	delta.tv_nsec += 1000000000;
+	--delta.tv_sec;
     }
-    close(fd);
+    last = now;
+    save_files[display].ts_off += delta.tv_sec * 1000000000 + delta.tv_nsec;
+    fprintf(
+	save_files[display].ts,
+	"%f\n",
+	(double)(save_files[display].ts_off) / 1000000
+    );
+    if (ferror(save_files[display].ts)) {
+        LOG(LOG_LEVEL_ERROR, "save_data: writing timestamp failed");
+        return 1;
+    }
+
     return 0;
 }
 #endif
@@ -724,8 +857,19 @@ process_enc_h264(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
         out_uint32_le(s, out_data_bytes);
     }
 
-#if SAVE_VIDEO
-    n_save_data(s->p, out_data_bytes, enc->width, enc->height);
+#ifdef SAVE_VIDEO
+    /* Grab raw video feed directly from the encoder. */
+    if (n_save_data(self, s->p, out_data_bytes, enc->width, enc->height)) {
+	/* In case we fail to save the video feed, forcefully end the session.
+	 * This enforces the guarantee, that we do not have a rogue session
+	 * without video capture running around. */
+	LOG(
+	    LOG_LEVEL_ERROR,
+	    "Failed to save raw video data, aborting session..."
+	);
+        g_set_wait_obj(self->mm->wm->pro_layer->self_term_event);
+	return 1;
+    }
 #endif
 
     enc_done = g_new0(XRDP_ENC_DATA_DONE, 1);
