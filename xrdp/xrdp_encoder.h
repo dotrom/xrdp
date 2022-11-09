@@ -34,6 +34,9 @@ struct xrdp_encoder
     int quant_idx_y;
     int quant_idx_u;
     int quant_idx_v;
+
+    /* Socket to transcoding server */
+    int conn;
 };
 
 /* used when scheduling tasks in xrdp_encoder.c */

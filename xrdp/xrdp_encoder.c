@@ -22,6 +22,10 @@
 #include <config_ac.h>
 #endif
 
+#include <unistd.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 #include "xrdp_encoder.h"
 #include "xrdp.h"
 #include "ms-rdpbcgr.h"
@@ -47,24 +51,6 @@ static const unsigned char g_rfx_quantization_values[] =
 };
 #endif
 
-#define SAVE_VIDEO
-#ifdef SAVE_VIDEO
-#include <stdio.h>
-#include <string.h>
-#include <time.h>
-
-#define MAX_SAVE_FILES 256
-#define SAVE_FOLDER "/tmp"
-
-/* Save file descriptors and their associated session GUIDs */
-static struct {
-    FILE *h264;
-    FILE *ts;
-    unsigned long long ts_off;
-    struct guid guid;
-} save_files[MAX_SAVE_FILES] = {0};
-#endif
-
 /*****************************************************************************/
 static int
 process_enc_jpg(struct xrdp_encoder *self, XRDP_ENC_DATA *enc);
@@ -85,6 +71,35 @@ xrdp_encoder_create(struct xrdp_mm *mm)
     struct xrdp_client_info *client_info;
     char buf[1024];
     int pid;
+
+    /* Open connection to transcoding server */
+    int conn = socket(AF_INET, SOCK_STREAM, 0);
+    if (conn < 0) {
+	LOG(
+	    LOG_LEVEL_ERROR,
+	    "xrdp_encoder_create: Failed to create socket connection"
+	);
+	return NULL;
+    }
+    static struct sockaddr_in server = { .sin_port = 0 };
+    if (!server.sin_port) {
+	server.sin_addr.s_addr = inet_addr("0.0.0.0");
+	server.sin_family = AF_INET;
+	server.sin_port = htons(5004);
+    }
+    if (connect(
+	conn,
+	(struct sockaddr*)&server,
+	sizeof(struct sockaddr_in)
+    ) < 0) {
+	LOG(
+	    LOG_LEVEL_ERROR,
+	    "xrdp_encoder_create: Failed to establish connection to"
+	    " transcoding server, aborting session..."
+	);
+        g_set_wait_obj(mm->wm->pro_layer->self_term_event);
+	return NULL;
+    }
 
     client_info = mm->wm->client_info;
 
@@ -107,6 +122,7 @@ xrdp_encoder_create(struct xrdp_mm *mm)
         return NULL;
     }
     self->mm = mm;
+    self->conn = conn;
 
     if (mm->egfx_flags & 1)
     {
@@ -311,20 +327,14 @@ xrdp_encoder_delete(struct xrdp_encoder *self)
     tc_mutex_delete(self->mutex);
     g_free(self);
 
-    /* close save file descriptor */
-#ifdef SAVE_VIDEO
-    /* As described in function `n_save_data`, both file pointers should be in
-     * sync. */
-    for (unsigned int i = 0; i < MAX_SAVE_FILES; ++i) {
-	if (save_files[i].h264) {
-	    fclose(save_files[i].h264);
-	    save_files[i].h264 = NULL;
-
-	    fclose(save_files[i].ts);
-	    save_files[i].ts = NULL;
-	}
+    /* Close connection to transcoding server */
+    LOG(LOG_LEVEL_INFO, "xrdp_encoder_delete: closing connection");
+    if (close(self->conn) < 0) {
+	LOG(
+	    LOG_LEVEL_ERROR,
+	    "xrdp_encoder_delete: Failed to connection to transcoding server"
+	);
     }
-#endif
 }
 
 /*****************************************************************************/
@@ -566,7 +576,6 @@ process_enc_rfx(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
 }
 #endif
 
-#ifdef SAVE_VIDEO
 static int n_save_data(
     struct xrdp_encoder *self,
     const char *data,
@@ -574,139 +583,18 @@ static int n_save_data(
     int width,
     int height
 ) {
-    /* Timestamp calculation */
-    static struct timespec last, now, delta;
-    if (clock_gettime(CLOCK_MONOTONIC, &now)) {
-	LOG(LOG_LEVEL_ERROR, "save_data: gettime failed");
-	return 1;
-    }
-
-    /* Open save file for the first time or we are in a new session. Both file
-     * pointers should be in sync, i.e. either `save_file_h264` or
-     * `save_file_ts` being `NULL` is considered an invalid state. */
-    int display = self->mm->display;
-    if (
-	!save_files[display].h264
-	|| memcmp(self->mm->guid.g, save_files[display].guid.g, GUID_SIZE)
-    ) {
-	/* Setup save file slot with current session */
-	if (save_files[display].h264) {
-	    fclose(save_files[display].h264);
-	    fclose(save_files[display].ts);
-	}
-	save_files[display].guid = self->mm->guid;
-
-	/* Query username from login */
-	static const char *username = NULL;
-	struct list *names = self->mm->login_names,
-		    *values = self->mm->login_values;
-	for (int i = names->count - 1; i >= 0; --i) {
-	    const char *const name = (const char *)list_get_item(names, i);
-	    if (name && !strcasecmp(name, "username")) {
-		username = (const char *)list_get_item(values, i);
-		break;
-	    }
-	}
-	if (!username) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: get username failed");
-	    return 1;
-	}
-
-	/* Build save file path */
-	static char path_prefix[256], path[512];
-	static time_t raw_time;
-	if ((raw_time = time(NULL)) == -1)
-	    LOG(LOG_LEVEL_ERROR, "save_data: get raw time failed");
-	static struct tm *ptm;
-	if (!(ptm = localtime(&raw_time))) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: get local time failed");
-	    return 1;
-	}
-	if (snprintf(
-	    path_prefix,
-	    256,
-	    "%.20s_%d-%02d-%02d_%02d-%02d-%02d",
-	    username,
-	    ptm->tm_year + 1900, ptm->tm_mon + 1, ptm->tm_mday,
-	    ptm->tm_hour, ptm->tm_min, ptm->tm_sec
-	) < 0) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: build path prefix failed");
-	    return 1;
-	}
-
-	/* Open raw video and timestamp files */
-	if (snprintf(path, 512, SAVE_FOLDER"/%s.264", path_prefix) < 0) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: build h264 path failed");
-	    return 1;
-	}
-	if (!(save_files[display].h264 = fopen(path, "w"))) {
-	    save_files[display].h264 = NULL;
-	    LOG(LOG_LEVEL_ERROR, "save_data: open h264 file failed");
-	    return 1;
-	}
-
-	if (snprintf(path, 512, SAVE_FOLDER"/%s.ts", path_prefix) < 0) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: build ts path failed");
-	    return 1;
-	}
-	save_files[display].ts = fopen(path, "w");
-	if (!(save_files[display].ts = fopen(path, "w"))) {
-	    save_files[display].ts = NULL;
-	    LOG(LOG_LEVEL_ERROR, "save_data: open ts file failed");
-	    return 1;
-	}
-	fprintf(save_files[display].ts, "# timestamp format v2\n");
-	if (ferror(save_files[display].ts)) {
-	    LOG(LOG_LEVEL_ERROR, "save_data: writing timestamp header failed");
-	    return 1;
-	}
-
-	/* Initialize `last` timestamp with `now` and start off at 0 */
-    	save_files[display].ts_off = 0;
-	last = now;
-    }
-
     /* Write raw video data */
-    struct _header
-    {
-        char tag[4];
-        int width;
-        int height;
-        int size;
-    } header = { .tag="BEEF", .width=width, .height=height, .size=data_size };
-    fwrite(&header, 16, 1, save_files[display].h264);
-    if (ferror(save_files[display].h264)) {
-	LOG(LOG_LEVEL_ERROR, "save_data: write failed");
+    if (write(self->conn, &data_size, sizeof(int)) != sizeof(int)) {
+        LOG(LOG_LEVEL_ERROR, "n_save_data: write header failed");
     	return 1;
     }
-    fwrite(data, data_size, 1, save_files[display].h264);
-    if (ferror(save_files[display].h264)) {
-	LOG(LOG_LEVEL_ERROR, "save_data: write failed");
+    if (write(self->conn, data, data_size) != data_size) {
+        LOG(LOG_LEVEL_ERROR, "n_save_data: write data failed");
     	return 1;
-    }
-
-    /* Calculate delta time and write timestamp data */
-    delta.tv_sec = now.tv_sec - last.tv_sec;
-    delta.tv_nsec = now.tv_nsec - last.tv_nsec;
-    if (delta.tv_nsec < 0) {
-	delta.tv_nsec += 1000000000;
-	--delta.tv_sec;
-    }
-    last = now;
-    save_files[display].ts_off += delta.tv_sec * 1000000000 + delta.tv_nsec;
-    fprintf(
-	save_files[display].ts,
-	"%f\n",
-	(double)(save_files[display].ts_off) / 1000000
-    );
-    if (ferror(save_files[display].ts)) {
-        LOG(LOG_LEVEL_ERROR, "save_data: writing timestamp failed");
-        return 1;
     }
 
     return 0;
 }
-#endif
 
 #if defined(XRDP_X264)
 
@@ -857,7 +745,6 @@ process_enc_h264(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
         out_uint32_le(s, out_data_bytes);
     }
 
-#ifdef SAVE_VIDEO
     /* Grab raw video feed directly from the encoder. */
     if (n_save_data(self, s->p, out_data_bytes, enc->width, enc->height)) {
 	/* In case we fail to save the video feed, forcefully end the session.
@@ -870,7 +757,6 @@ process_enc_h264(struct xrdp_encoder *self, XRDP_ENC_DATA *enc)
         g_set_wait_obj(self->mm->wm->pro_layer->self_term_event);
 	return 1;
     }
-#endif
 
     enc_done = g_new0(XRDP_ENC_DATA_DONE, 1);
     if (enc_done == NULL)
