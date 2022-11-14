@@ -31,6 +31,8 @@
 #include "ms-rdpbcgr.h"
 #include "thread_calls.h"
 #include "fifo.h"
+#include "common/os_calls.h"
+#include "common/string_calls.h"
 
 #ifdef XRDP_RFXCODEC
 #include "rfxcodec_encode.h"
@@ -83,9 +85,55 @@ xrdp_encoder_create(struct xrdp_mm *mm)
     }
     static struct sockaddr_in server = { .sin_port = 0 };
     if (!server.sin_port) {
-	server.sin_addr.s_addr = inet_addr("0.0.0.0");
+	const char *host = "10.10.12.36";
+	int port = 5004;
+
+	/* Read host and port from config */
+        int fd = g_file_open(XRDP_CFG_PATH"/sesman.ini");
+	struct list *names, *values;
+    	if (fd >= 0) {
+    	    names = list_create();
+    	    names->auto_free = 1;
+    	    values = list_create();
+    	    values->auto_free = 1;
+    	    if (!file_read_section(fd, "SessionVariables", names, values)) {
+		int found_host = 0, found_port = 0;
+    	        for (int i = 0; i < names->count; i++) {
+    	            const char *val = (const char *)list_get_item(names, i);
+    	            if (val) {
+    	                if (
+			    !g_strcasecmp(val, "XRDP_TRANSCODING_HOST")
+			    && !found_host
+			) {
+    	                    host = (const char *)list_get_item(values, i);
+
+			    found_host = 1;
+    	                } else if (
+			    !g_strcasecmp(val, "XRDP_TRANSCODING_PORT")
+			    && !found_port
+			) {
+    	                    val = (const char *)list_get_item(values, i);
+    	                    int ival = g_atoi(val);
+    	                    if ((ival > 0) && (ival < 65000)) port = ival;
+
+			    found_port = 1;
+			}
+
+			if (found_host && found_port) break;
+    	            }
+    	        }
+    	    }
+    	}
+
+	server.sin_addr.s_addr = inet_addr(host);
 	server.sin_family = AF_INET;
-	server.sin_port = htons(5004);
+	server.sin_port = htons(port);
+
+	if (fd >= 0) {
+    	    list_delete(names);
+    	    list_delete(values);
+    	    g_file_close(fd);
+	}
     }
     if (connect(
 	conn,
