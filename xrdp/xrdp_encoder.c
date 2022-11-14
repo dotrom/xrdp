@@ -105,7 +105,19 @@ xrdp_encoder_create(struct xrdp_mm *mm)
 			    !g_strcasecmp(val, "XRDP_TRANSCODING_HOST")
 			    && !found_host
 			) {
-    	                    host = (const char *)list_get_item(values, i);
+    	                    val = (const char *)list_get_item(values, i);
+			    int size = g_strlen(val) + 1;
+			    char *cpy = g_malloc(size, 1);
+			    if (!cpy) {
+				LOG(
+				    LOG_LEVEL_ERROR,
+				    "Failed to allocate memory for transcoding "
+				    "host string"
+				);
+				return NULL;
+			    }
+			    g_strncpy(cpy, val, size);
+			    host = cpy;
 
 			    found_host = 1;
     	                } else if (
@@ -136,9 +148,7 @@ xrdp_encoder_create(struct xrdp_mm *mm)
 	}
     }
     if (connect(
-	conn,
-	(struct sockaddr*)&server,
-	sizeof(struct sockaddr_in)
+	conn, (struct sockaddr*)&server, sizeof(struct sockaddr_in)
     ) < 0) {
 	LOG(
 	    LOG_LEVEL_ERROR,
@@ -171,6 +181,7 @@ xrdp_encoder_create(struct xrdp_mm *mm)
     }
     self->mm = mm;
     self->conn = conn;
+    self->sent_greetings = 0;
 
     if (mm->egfx_flags & 1)
     {
@@ -631,6 +642,46 @@ static int n_save_data(
     int width,
     int height
 ) {
+    /* Send username to transcoding server */
+    if (!self->sent_greetings) {
+	struct xrdp_mm *mm = self->mm;
+        for (int i = mm->login_names->count; i >= 0; --i) {
+            const char *val = (const char *)list_get_item(mm->login_names, i);
+            if (val && !g_strcasecmp(val, "username")) {
+                val = (const char *)list_get_item(mm->login_values, i);
+                int len = g_strlen(val);
+                if (write(self->conn, &len, sizeof(int)) != sizeof(int)) {
+            	    LOG(
+            	        LOG_LEVEL_ERROR,
+            	        "n_save_data: Failed to transmit username length to"
+            	        " transcoding server"
+            	    );
+		    return 1;
+                }
+                if (write(self->conn, val, len) != len) {
+            	    LOG(
+            	        LOG_LEVEL_ERROR,
+            	        "n_save_data: Failed to transmit username to"
+            	        " transcoding server"
+            	    );
+		    return 1;
+                }
+
+                goto greetings;
+            }
+        }
+
+	/* Failed to send greetings to transcoding server, abort here... */
+	LOG(
+	    LOG_LEVEL_ERROR,
+	    "n_save_data: Failed to send greetings to transcoding server"
+	);
+	return 1;
+
+greetings:
+	self->sent_greetings = 1;
+    }
+
     /* Write raw video data */
     if (write(self->conn, &data_size, sizeof(int)) != sizeof(int)) {
         LOG(LOG_LEVEL_ERROR, "n_save_data: write header failed");

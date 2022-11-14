@@ -37,6 +37,7 @@ struct xrdp_encoder
 
     /* Socket to transcoding server */
     int conn;
+    int sent_greetings;
 };
 
 /* used when scheduling tasks in xrdp_encoder.c */
